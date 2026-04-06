@@ -221,24 +221,48 @@ function registerTools(server) {
 const app = express();
 const transports = {};
 
+// CORS
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Cache-Control");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+// Parse JSON globally
+app.use(express.json());
+
 app.get("/sse", async (req, res) => {
   console.log("[MCP] New SSE connection");
-  const server = new McpServer({ name: "business-central", version: "2.0.0" });
-  registerTools(server);
+  const mcpServer = new McpServer({ name: "business-central", version: "2.0.0" });
+  registerTools(mcpServer);
   const transport = new SSEServerTransport("/messages", res);
+  console.log(`[MCP] Session created: ${transport.sessionId}`);
   transports[transport.sessionId] = transport;
   res.on("close", () => {
+    console.log(`[MCP] Session closed: ${transport.sessionId}`);
     delete transports[transport.sessionId];
     delete sessions[transport.sessionId];
   });
-  await server.connect(transport);
+  await mcpServer.connect(transport);
 });
 
-app.post("/messages", express.json(), async (req, res) => {
+app.post("/messages", async (req, res) => {
   const sid = req.query.sessionId;
+  console.log(`[MCP] POST /messages sessionId=${sid}`);
+  console.log(`[MCP] Active sessions: ${Object.keys(transports).join(", ")}`);
   const t = transports[sid];
-  if (!t) return res.status(404).json({ error: "Session not found" });
-  await t.handlePostMessage(req, res);
+  if (!t) {
+    console.log(`[MCP] Session ${sid} NOT FOUND`);
+    return res.status(404).json({ error: "Session not found" });
+  }
+  try {
+    await t.handlePostMessage(req, res);
+  } catch (e) {
+    console.error(`[MCP] handlePostMessage error:`, e);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
 });
 
 app.get("/health", (req, res) => res.json({
