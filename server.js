@@ -3,342 +3,356 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
 import { z } from "zod";
 
-// Try to load StreamableHTTP (available in newer SDK versions)
-let StreamableHTTPServerTransport;
-try {
-  const mod = await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
-  StreamableHTTPServerTransport = mod.StreamableHTTPServerTransport;
-  console.log("[INIT] StreamableHTTP transport available");
-} catch {
-  console.log("[INIT] StreamableHTTP not available, using SSE only");
-}
-
 const PORT = process.env.PORT || 3001;
 
-// ============ SESSION STORE ============
-const sessions = {};
-const transports = {};
+// Global BC connection state
+const bc = {
+  connected: false,
+  tenant: "",
+  environment: "",
+  clientId: "",
+  clientSecret: "",
+  scope: "https://api.businesscentral.dynamics.com/.default",
+  token: null,
+  tokenExpiry: 0
+};
 
-function getSession(id) {
-  if (!sessions[id]) sessions[id] = { connected: false };
-  return sessions[id];
-}
-
-// ============ TOKEN MANAGEMENT ============
-async function getToken(sess) {
-  if (!sess.connected) throw new Error("No conectado. Usa bc_connect primero.");
-  if (sess.token && Date.now() < sess.tokenExpiry) return sess.token;
-  console.log(`[AUTH] Token for tenant ${sess.tenant.substring(0, 8)}...`);
-  const r = await fetch(`https://login.microsoftonline.com/${sess.tenant}/oauth2/v2.0/token`, {
+async function getToken() {
+  if (!bc.connected) {
+    throw new Error("Not connected to BC. Use bc_connect first.");
+  }
+  if (bc.token && Date.now() < bc.tokenExpiry) {
+    return bc.token;
+  }
+  var tokenUrl = "https://login.microsoftonline.com/" + bc.tenant + "/oauth2/v2.0/token";
+  var body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: bc.clientId,
+    client_secret: bc.clientSecret,
+    scope: bc.scope
+  });
+  var res = await fetch(tokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: sess.clientId,
-      client_secret: sess.clientSecret,
-      scope: sess.scope || "https://api.businesscentral.dynamics.com/.default",
-    }),
+    body: body
   });
-  if (!r.ok) throw new Error(`Auth error ${r.status}: ${await r.text()}`);
-  const d = await r.json();
-  sess.token = d.access_token;
-  sess.tokenExpiry = Date.now() + (d.expires_in - 120) * 1000;
-  return sess.token;
+  if (!res.ok) {
+    var errText = await res.text();
+    throw new Error("Auth error " + res.status + ": " + errText.substring(0, 300));
+  }
+  var data = await res.json();
+  bc.token = data.access_token;
+  bc.tokenExpiry = Date.now() + (data.expires_in - 120) * 1000;
+  console.log("[AUTH] Token obtained, expires in " + data.expires_in + "s");
+  return bc.token;
 }
 
-function apiBase(sess) {
-  return `https://api.businesscentral.dynamics.com/v2.0/${sess.tenant}/${sess.environment}/api/v2.0`;
+function getApiBase() {
+  return "https://api.businesscentral.dynamics.com/v2.0/" + bc.tenant + "/" + bc.environment + "/api/v2.0";
 }
 
-// ============ BC API HELPERS ============
-async function bcGet(sess, endpoint, params = {}) {
-  const tk = await getToken(sess);
-  const qp = [];
-  if (params.top) qp.push(`$top=${params.top}`);
-  if (params.filter) qp.push(`$filter=${encodeURIComponent(params.filter)}`);
-  if (params.select) qp.push(`$select=${params.select}`);
-  if (params.orderby) qp.push(`$orderby=${encodeURIComponent(params.orderby)}`);
-  const qs = qp.length ? `?${qp.join("&")}` : "";
-  const url = `${apiBase(sess)}/${endpoint}${qs}`;
-  console.log(`[BC] GET ${url}`);
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${tk}`, Accept: "application/json" } });
-  if (!r.ok) throw new Error(`BC ${r.status}: ${(await r.text()).substring(0, 500)}`);
-  const d = await r.json();
-  return d.value || d;
-}
-
-async function bcPost(sess, endpoint, payload) {
-  const tk = await getToken(sess);
-  const url = `${apiBase(sess)}/${endpoint}`;
-  console.log(`[BC] POST ${url}`);
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${tk}`, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(payload),
+async function bcGet(endpoint, options) {
+  var tk = await getToken();
+  var parts = [];
+  if (options && options.top) parts.push("$top=" + options.top);
+  if (options && options.filter) parts.push("$filter=" + encodeURIComponent(options.filter));
+  if (options && options.select) parts.push("$select=" + options.select);
+  if (options && options.orderby) parts.push("$orderby=" + encodeURIComponent(options.orderby));
+  var qs = parts.length > 0 ? "?" + parts.join("&") : "";
+  var url = getApiBase() + "/" + endpoint + qs;
+  console.log("[BC] GET " + url);
+  var res = await fetch(url, {
+    headers: { "Authorization": "Bearer " + tk, "Accept": "application/json" }
   });
-  if (!r.ok) throw new Error(`BC POST ${r.status}: ${(await r.text()).substring(0, 500)}`);
-  return r.json();
+  if (!res.ok) {
+    var errText = await res.text();
+    throw new Error("BC error " + res.status + ": " + errText.substring(0, 500));
+  }
+  var data = await res.json();
+  return data.value || data;
 }
 
-async function bcPatch(sess, endpoint, payload, etag) {
-  const tk = await getToken(sess);
-  const url = `${apiBase(sess)}/${endpoint}`;
-  console.log(`[BC] PATCH ${url}`);
-  const r = await fetch(url, {
-    method: "PATCH",
-    headers: { Authorization: `Bearer ${tk}`, "Content-Type": "application/json", Accept: "application/json", "If-Match": etag },
-    body: JSON.stringify(payload),
+async function bcWrite(method, endpoint, payload, etag) {
+  var tk = await getToken();
+  var url = getApiBase() + "/" + endpoint;
+  console.log("[BC] " + method + " " + url);
+  var headers = {
+    "Authorization": "Bearer " + tk,
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+  };
+  if (etag) headers["If-Match"] = etag;
+  var res = await fetch(url, {
+    method: method,
+    headers: headers,
+    body: JSON.stringify(payload)
   });
-  if (!r.ok) throw new Error(`BC PATCH ${r.status}: ${(await r.text()).substring(0, 500)}`);
-  return r.json();
+  if (!res.ok) {
+    var errText = await res.text();
+    throw new Error("BC " + method + " error " + res.status + ": " + errText.substring(0, 500));
+  }
+  return res.json();
 }
 
-// ============ REGISTER TOOLS ============
-function registerTools(server, sessionId) {
-  server.tool("bc_connect", "Conecta con un tenant de Business Central.", {
-    tenant: z.string().describe("Tenant ID (GUID)"),
-    environment: z.string().describe("Entorno: Production, Sandbox"),
-    clientId: z.string().describe("Client ID de Azure AD"),
-    clientSecret: z.string().describe("Client Secret"),
-    scope: z.string().optional().default("https://api.businesscentral.dynamics.com/.default"),
-  }, async ({ tenant, environment, clientId, clientSecret, scope }) => {
-    const sess = getSession(sessionId);
-    Object.assign(sess, { tenant, environment, clientId, clientSecret, scope, token: null, tokenExpiry: 0 });
+// ===== MCP Server =====
+var server = new McpServer({
+  name: "business-central",
+  version: "3.0.0"
+});
+
+server.tool(
+  "bc_connect",
+  "Connect to any Business Central tenant. Required before using other tools. Credentials are used only for this session.",
+  {
+    tenant: z.string().describe("Azure AD Tenant ID (GUID)"),
+    environment: z.string().describe("BC Environment name: Production, Sandbox, etc."),
+    clientId: z.string().describe("Azure AD App Registration Client ID"),
+    clientSecret: z.string().describe("Azure AD App Registration Client Secret")
+  },
+  async function(params) {
+    bc.tenant = params.tenant;
+    bc.environment = params.environment;
+    bc.clientId = params.clientId;
+    bc.clientSecret = params.clientSecret;
+    bc.token = null;
+    bc.tokenExpiry = 0;
     try {
-      await getToken(sess);
-      sess.connected = true;
-      return { content: [{ type: "text", text: `Conectado a BC!\nTenant: ${tenant}\nEntorno: ${environment}\nToken OK` }] };
-    } catch (e) {
-      sess.connected = false;
-      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
+      await getToken();
+      bc.connected = true;
+      return {
+        content: [{ type: "text", text: "Connected to Business Central!\nTenant: " + params.tenant + "\nEnvironment: " + params.environment }]
+      };
+    } catch (err) {
+      bc.connected = false;
+      return {
+        content: [{ type: "text", text: "Connection failed: " + err.message }]
+      };
     }
-  });
+  }
+);
 
-  server.tool("bc_list_companies", "Lista empresas disponibles", {}, async () => {
-    const data = await bcGet(getSession(sessionId), "companies");
-    return { content: [{ type: "text", text: JSON.stringify(data.map(c => ({ id: c.id, name: c.name, displayName: c.displayName })), null, 2) }] };
-  });
+server.tool(
+  "bc_status",
+  "Check current connection status",
+  {},
+  async function() {
+    if (!bc.connected) {
+      return { content: [{ type: "text", text: "Not connected. Use bc_connect first." }] };
+    }
+    return {
+      content: [{ type: "text", text: "Connected to: " + bc.tenant + " / " + bc.environment + "\nToken: " + (bc.token ? "Active" : "Expired") }]
+    };
+  }
+);
 
-  server.tool("bc_query", "Consulta cualquier entidad de BC", {
-    companyId: z.string().describe("ID empresa (GUID)"),
-    entity: z.string().describe("customers, vendors, items, salesOrders, salesInvoices, etc."),
+server.tool(
+  "bc_list_companies",
+  "List all companies available in the connected Business Central tenant",
+  {},
+  async function() {
+    var data = await bcGet("companies");
+    var result = data.map(function(c) {
+      return { id: c.id, name: c.name, displayName: c.displayName };
+    });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "bc_query",
+  "Query any Business Central entity: customers, vendors, items, salesInvoices, salesOrders, purchaseInvoices, purchaseOrders, accounts, generalLedgerEntries, employees, bankAccounts, companyInformation, agedAccountsReceivables, agedAccountsPayables, contacts, opportunities, dimensions, projects, etc.",
+  {
+    companyId: z.string().describe("Company ID (GUID). Use bc_list_companies to get it."),
+    entity: z.string().describe("Entity name: customers, vendors, items, salesInvoices, etc."),
+    top: z.number().optional().default(20).describe("Max records to return"),
+    filter: z.string().optional().describe("OData filter: balanceDue gt 0, city eq 'Madrid'"),
+    select: z.string().optional().describe("Fields to return: displayName,number,email"),
+    orderby: z.string().optional().describe("Sort: balanceDue desc")
+  },
+  async function(params) {
+    var data = await bcGet(
+      "companies(" + params.companyId + ")/" + params.entity,
+      { top: params.top, filter: params.filter, select: params.select, orderby: params.orderby }
+    );
+    return {
+      content: [{ type: "text", text: params.entity + ": " + data.length + " records\n\n" + JSON.stringify(data, null, 2) }]
+    };
+  }
+);
+
+server.tool(
+  "bc_customer_summary",
+  "Get a complete financial summary of a customer including recent invoices and aging",
+  {
+    companyId: z.string().describe("Company ID"),
+    customerNumber: z.string().describe("Customer number")
+  },
+  async function(params) {
+    var base = "companies(" + params.companyId + ")";
+    var customers = await bcGet(base + "/customers", { filter: "number eq '" + params.customerNumber + "'" });
+    if (!customers.length) {
+      return { content: [{ type: "text", text: "Customer " + params.customerNumber + " not found" }] };
+    }
+    var invoices = await bcGet(base + "/salesInvoices", {
+      filter: "customerNumber eq '" + params.customerNumber + "'",
+      top: 10,
+      orderby: "invoiceDate desc"
+    });
+    return {
+      content: [{ type: "text", text: JSON.stringify({ customer: customers[0], recentInvoices: invoices }, null, 2) }]
+    };
+  }
+);
+
+server.tool(
+  "bc_sales_summary",
+  "Get a sales summary with recent invoices, totals, and top customers",
+  {
+    companyId: z.string().describe("Company ID"),
+    top: z.number().optional().default(20)
+  },
+  async function(params) {
+    var invoices = await bcGet(
+      "companies(" + params.companyId + ")/salesInvoices",
+      { top: params.top, orderby: "invoiceDate desc", select: "number,invoiceDate,customerName,totalAmountIncludingTax,status,remainingAmount" }
+    );
+    var totalSales = 0;
+    var totalPending = 0;
+    invoices.forEach(function(inv) {
+      totalSales += inv.totalAmountIncludingTax || 0;
+      totalPending += inv.remainingAmount || 0;
+    });
+    return {
+      content: [{ type: "text", text: JSON.stringify({ count: invoices.length, totalSales: totalSales, totalPending: totalPending, recent: invoices.slice(0, 5) }, null, 2) }]
+    };
+  }
+);
+
+server.tool(
+  "bc_create",
+  "Create a new record in Business Central (customer, item, order, invoice, etc.)",
+  {
+    companyId: z.string().describe("Company ID"),
+    entity: z.string().describe("Entity: customers, items, salesOrders, etc."),
+    data: z.string().describe("JSON string with the record data")
+  },
+  async function(params) {
+    var result = await bcWrite("POST", "companies(" + params.companyId + ")/" + params.entity, JSON.parse(params.data));
+    return { content: [{ type: "text", text: "Created:\n" + JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "bc_update",
+  "Update an existing record in Business Central",
+  {
+    companyId: z.string().describe("Company ID"),
+    entity: z.string().describe("Entity: customers, items, etc."),
+    entityId: z.string().describe("Record ID (GUID)"),
+    etag: z.string().describe("Record ETag (from bc_query)"),
+    data: z.string().describe("JSON string with fields to update")
+  },
+  async function(params) {
+    var result = await bcWrite(
+      "PATCH",
+      "companies(" + params.companyId + ")/" + params.entity + "(" + params.entityId + ")",
+      JSON.parse(params.data),
+      params.etag
+    );
+    return { content: [{ type: "text", text: "Updated:\n" + JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "bc_custom",
+  "Query custom BC APIs (custom AL pages). Example: api/ESDEN/app1/v2.0/companies({id})/jobESDEN",
+  {
+    url: z.string().describe("Relative path from api/v2.0/ or full URL"),
     top: z.number().optional().default(20),
-    filter: z.string().optional().describe("Filtro OData"),
-    select: z.string().optional().describe("Campos"),
-    orderby: z.string().optional().describe("Orden"),
-  }, async ({ companyId, entity, top, filter, select, orderby }) => {
-    const data = await bcGet(getSession(sessionId), `companies(${companyId})/${entity}`, { top, filter, select, orderby });
-    return { content: [{ type: "text", text: `${entity}: ${data.length} registros\n\n${JSON.stringify(data, null, 2)}` }] };
-  });
+    filter: z.string().optional()
+  },
+  async function(params) {
+    var fullUrl = params.url.indexOf("http") === 0 ? params.url : getApiBase() + "/" + params.url;
+    var parts = [];
+    if (params.top) parts.push("$top=" + params.top);
+    if (params.filter) parts.push("$filter=" + encodeURIComponent(params.filter));
+    if (parts.length > 0) fullUrl += "?" + parts.join("&");
+    var tk = await getToken();
+    var res = await fetch(fullUrl, {
+      headers: { "Authorization": "Bearer " + tk, "Accept": "application/json" }
+    });
+    if (!res.ok) {
+      var errText = await res.text();
+      throw new Error("BC " + res.status + ": " + errText.substring(0, 500));
+    }
+    var data = await res.json();
+    var records = data.value || data;
+    var count = Array.isArray(records) ? records.length : 1;
+    return {
+      content: [{ type: "text", text: count + " records:\n" + JSON.stringify(records, null, 2) }]
+    };
+  }
+);
 
-  server.tool("bc_customer_summary", "Resumen financiero de un cliente", {
-    companyId: z.string(),
-    customerNumber: z.string(),
-  }, async ({ companyId, customerNumber }) => {
-    const sess = getSession(sessionId);
-    const b = `companies(${companyId})`;
-    const cust = await bcGet(sess, `${b}/customers`, { filter: `number eq '${customerNumber}'` });
-    if (!cust.length) return { content: [{ type: "text", text: `Cliente ${customerNumber} no encontrado` }] };
-    const inv = await bcGet(sess, `${b}/salesInvoices`, { filter: `customerNumber eq '${customerNumber}'`, top: 10, orderby: "invoiceDate desc" });
-    const aged = await bcGet(sess, `${b}/agedAccountsReceivables`, { filter: `customerNumber eq '${customerNumber}'` });
-    return { content: [{ type: "text", text: JSON.stringify({ customer: cust[0], recentInvoices: inv, aging: aged }, null, 2) }] };
-  });
+// ===== Express + SSE Transport =====
+var app = express();
+var transports = {};
 
-  server.tool("bc_inventory", "Estado del inventario", {
-    companyId: z.string(),
-    lowStockThreshold: z.number().optional().default(10),
-  }, async ({ companyId, lowStockThreshold }) => {
-    const items = await bcGet(getSession(sessionId), `companies(${companyId})/items`, { top: 100, select: "displayName,number,inventory,unitPrice,unitCost,itemCategoryCode" });
-    const low = items.filter(i => i.inventory <= lowStockThreshold && i.inventory >= 0);
-    const totalVal = items.reduce((s, i) => s + (i.inventory || 0) * (i.unitCost || 0), 0);
-    return { content: [{ type: "text", text: JSON.stringify({ totalItems: items.length, totalValue: totalVal, lowStock: low, topByValue: items.map(i => ({ ...i, value: (i.inventory || 0) * (i.unitCost || 0) })).sort((a, b) => b.value - a.value).slice(0, 10) }, null, 2) }] };
-  });
-
-  server.tool("bc_sales_summary", "Resumen de ventas", {
-    companyId: z.string(),
-    top: z.number().optional().default(20),
-  }, async ({ companyId, top }) => {
-    const inv = await bcGet(getSession(sessionId), `companies(${companyId})/salesInvoices`, { top, orderby: "invoiceDate desc", select: "number,invoiceDate,customerName,totalAmountIncludingTax,status,remainingAmount" });
-    const total = inv.reduce((s, i) => s + (i.totalAmountIncludingTax || 0), 0);
-    const pending = inv.reduce((s, i) => s + (i.remainingAmount || 0), 0);
-    const byCust = {};
-    inv.forEach(i => { if (!byCust[i.customerName]) byCust[i.customerName] = { total: 0, count: 0 }; byCust[i.customerName].total += i.totalAmountIncludingTax || 0; byCust[i.customerName].count++; });
-    return { content: [{ type: "text", text: JSON.stringify({ invoiceCount: inv.length, totalSales: total, totalPending: pending, topCustomers: Object.entries(byCust).map(([n, d]) => ({ name: n, ...d })).sort((a, b) => b.total - a.total).slice(0, 10), recent: inv.slice(0, 5) }, null, 2) }] };
-  });
-
-  server.tool("bc_create", "Crear registro en BC", {
-    companyId: z.string(),
-    entity: z.string(),
-    data: z.string().describe("JSON con los datos"),
-  }, async ({ companyId, entity, data }) => {
-    const result = await bcPost(getSession(sessionId), `companies(${companyId})/${entity}`, JSON.parse(data));
-    return { content: [{ type: "text", text: `Creado OK:\n${JSON.stringify(result, null, 2)}` }] };
-  });
-
-  server.tool("bc_update", "Actualizar registro en BC", {
-    companyId: z.string(),
-    entity: z.string(),
-    entityId: z.string(),
-    etag: z.string(),
-    data: z.string(),
-  }, async ({ companyId, entity, entityId, etag, data }) => {
-    const result = await bcPatch(getSession(sessionId), `companies(${companyId})/${entity}(${entityId})`, JSON.parse(data), etag);
-    return { content: [{ type: "text", text: `Actualizado OK:\n${JSON.stringify(result, null, 2)}` }] };
-  });
-
-  server.tool("bc_custom", "Consulta APIs personalizadas", {
-    url: z.string(),
-    top: z.number().optional().default(20),
-    filter: z.string().optional(),
-  }, async ({ url, top, filter }) => {
-    const sess = getSession(sessionId);
-    const full = url.startsWith("http") ? url : `${apiBase(sess)}/${url}`;
-    const qp = [];
-    if (top) qp.push(`$top=${top}`);
-    if (filter) qp.push(`$filter=${encodeURIComponent(filter)}`);
-    const qs = qp.length ? `?${qp.join("&")}` : "";
-    const tk = await getToken(sess);
-    const r = await fetch(`${full}${qs}`, { headers: { Authorization: `Bearer ${tk}`, Accept: "application/json" } });
-    if (!r.ok) throw new Error(`BC ${r.status}: ${(await r.text()).substring(0, 500)}`);
-    const d = await r.json();
-    const records = d.value || d;
-    return { content: [{ type: "text", text: `${Array.isArray(records) ? records.length : 1} registros:\n${JSON.stringify(records, null, 2)}` }] };
-  });
-
-  server.tool("bc_status", "Estado de la conexion", {}, async () => {
-    const sess = getSession(sessionId);
-    if (!sess.connected) return { content: [{ type: "text", text: "No conectado." }] };
-    return { content: [{ type: "text", text: `Conectado:\n  Tenant: ${sess.tenant}\n  Entorno: ${sess.environment}\n  Token: ${sess.token ? "Activo" : "Expirado"}` }] };
-  });
-}
-
-// ============ CREATE SERVER FOR A CONNECTION ============
-function createServerForSession(sessionId) {
-  const mcpServer = new McpServer({ name: "business-central", version: "2.0.0" });
-  registerTools(mcpServer, sessionId);
-  return mcpServer;
-}
-
-// ============ EXPRESS ============
-const app = express();
-
-// CORS
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id, Cache-Control");
-  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
-  if (req.method === "OPTIONS") return res.status(204).end();
+// Important: disable proxy buffering for SSE
+app.use(function(req, res, next) {
+  res.setHeader("X-Accel-Buffering", "no");
   next();
 });
 
-app.use(express.json());
-
-// ---- STREAMABLE HTTP (POST /sse) ----
-app.post("/sse", async (req, res) => {
-  if (!StreamableHTTPServerTransport) {
-    return res.status(404).json({ error: "Streamable HTTP not supported" });
-  }
-
-  const sessionId = req.headers["mcp-session-id"];
-
-  if (sessionId && transports[sessionId]) {
-    console.log(`[MCP] Streamable message for session: ${sessionId}`);
-    try {
-      await transports[sessionId].handleRequest(req, res);
-    } catch (e) {
-      console.error(`[MCP] Error:`, e);
-      if (!res.headersSent) res.status(500).json({ error: e.message });
-    }
-    return;
-  }
-
-  // New streamable session
-  console.log("[MCP] New Streamable HTTP session");
-  const sid = `sh_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const mcpServer = createServerForSession(sid);
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sid });
-  transports[sid] = transport;
-
-  transport.onclose = () => {
-    console.log(`[MCP] Streamable session closed: ${sid}`);
-    delete transports[sid];
-    delete sessions[sid];
-  };
-
-  await mcpServer.connect(transport);
-  console.log(`[MCP] Streamable session created: ${sid}`);
-  await transport.handleRequest(req, res);
-});
-
-// ---- SSE LEGACY (GET /sse) ----
-app.get("/sse", async (req, res) => {
-  // If streamable session wants SSE stream
-  const sessionId = req.headers["mcp-session-id"];
-  if (sessionId && transports[sessionId] && StreamableHTTPServerTransport) {
-    try {
-      await transports[sessionId].handleRequest(req, res);
-    } catch (e) {
-      if (!res.headersSent) res.status(500).json({ error: e.message });
-    }
-    return;
-  }
-
-  // Legacy SSE transport
-  console.log("[MCP] New legacy SSE connection");
-  const sid = `sse_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const mcpServer = createServerForSession(sid);
-  const transport = new SSEServerTransport("/messages", res);
+app.get("/sse", async function(req, res) {
+  console.log("[MCP] New SSE connection from " + req.ip);
+  var transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
-
-  res.on("close", () => {
-    console.log(`[MCP] SSE session closed: ${transport.sessionId}`);
+  res.on("close", function() {
+    console.log("[MCP] SSE connection closed: " + transport.sessionId);
     delete transports[transport.sessionId];
-    delete sessions[sid];
   });
-
-  await mcpServer.connect(transport);
-  console.log(`[MCP] SSE session created: ${transport.sessionId}`);
+  await server.connect(transport);
 });
 
-// ---- SSE LEGACY (POST /messages) ----
-app.post("/messages", async (req, res) => {
-  const sid = req.query.sessionId;
-  console.log(`[MCP] POST /messages sid=${sid}`);
-  const t = transports[sid];
-  if (!t) return res.status(404).json({ error: "Session not found" });
-  try {
-    await t.handlePostMessage(req, res);
-  } catch (e) {
-    console.error(`[MCP] Error:`, e);
-    if (!res.headersSent) res.status(500).json({ error: e.message });
+app.post("/messages", express.json(), async function(req, res) {
+  var sessionId = req.query.sessionId;
+  var transport = transports[sessionId];
+  if (!transport) {
+    return res.status(404).json({ error: "Session not found" });
   }
+  await transport.handlePostMessage(req, res);
 });
 
-// ---- DELETE session ----
-app.delete("/sse", async (req, res) => {
-  const sessionId = req.headers["mcp-session-id"];
-  if (sessionId && transports[sessionId]) {
-    try {
-      await transports[sessionId].handleRequest(req, res);
-    } catch (e) {
-      if (!res.headersSent) res.status(500).json({ error: e.message });
-    }
-    return;
-  }
-  res.status(404).json({ error: "Session not found" });
+app.get("/health", function(req, res) {
+  res.json({
+    status: "ok",
+    version: "3.0.0",
+    mode: "multi-tenant-dynamic",
+    connected: bc.connected,
+    tenant: bc.tenant ? bc.tenant.substring(0, 8) + "..." : "none",
+    environment: bc.environment || "none",
+    activeSessions: Object.keys(transports).length,
+    tools: [
+      "bc_connect", "bc_status", "bc_list_companies", "bc_query",
+      "bc_customer_summary", "bc_sales_summary",
+      "bc_create", "bc_update", "bc_custom"
+    ]
+  });
 });
 
-// ---- HEALTH ----
-app.get("/health", (req, res) => res.json({
-  status: "ok",
-  version: "2.0.0",
-  streamableHttp: !!StreamableHTTPServerTransport,
-  activeSessions: Object.keys(transports).length,
-}));
+app.get("/", function(req, res) {
+  res.json({
+    name: "Business Central MCP Server",
+    version: "3.0.0",
+    description: "Connect Claude to any Microsoft Dynamics 365 Business Central tenant",
+    sse_endpoint: "/sse",
+    health_endpoint: "/health"
+  });
+});
 
-app.listen(PORT, () => {
-  console.log(`\n  BC MCP Server v2.0`);
-  console.log(`  Transports: SSE${StreamableHTTPServerTransport ? " + Streamable HTTP" : ""}`);
-  console.log(`  Port: ${PORT}\n`);
+app.listen(PORT, "0.0.0.0", function() {
+  console.log("BC MCP Server v3.0 listening on port " + PORT);
+  console.log("SSE endpoint: /sse");
+  console.log("Health: /health");
 });
