@@ -130,6 +130,33 @@ function registerTools(srv) {
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
   });
 
+  srv.tool("bc_custom_query", "Query any BC endpoint: standard API, custom API, OData v4 or web services", Object.assign({}, C, {
+    companyId: z.string().optional().describe("Company GUID (optional, include it in path if needed)"),
+    path: z.string().describe("Full path after the base URL. Examples: '/api/v2.0/companies({id})/customers' | '/api/esden/matriculas/v1.0/companies({id})/matriculas' | '/ODataV4/Company(\\'CRONUS\\')/MiPagina'"),
+    baseUrl: z.string().optional().describe("Override base URL. Default: 'https://api.businesscentral.dynamics.com/v2.0/{tenant}/{environment}'. Use this for OData or web services."),
+    method: z.string().optional().default("GET").describe("HTTP method: GET, POST, PATCH, DELETE"),
+    body: z.string().optional().describe("JSON body for POST/PATCH"),
+    top: z.number().optional(),
+    filter: z.string().optional(),
+    select: z.string().optional(),
+    orderby: z.string().optional()
+  }), async function(p) {
+    var tk = await getToken(p.tenant, p.clientId, p.clientSecret);
+    var base = p.baseUrl || ("https://api.businesscentral.dynamics.com/v2.0/" + p.tenant + "/" + p.environment);
+    var qs = [];
+    if (p.top) qs.push("$top=" + p.top);
+    if (p.filter) qs.push("$filter=" + encodeURIComponent(p.filter));
+    if (p.select) qs.push("$select=" + p.select);
+    if (p.orderby) qs.push("$orderby=" + encodeURIComponent(p.orderby));
+    var url = base + p.path + (qs.length ? "?" + qs.join("&") : "");
+    var opts = { method: p.method || "GET", headers: { Authorization: "Bearer " + tk, Accept: "application/json", "Content-Type": "application/json" } };
+    if (p.body && p.method !== "GET") opts.body = p.body;
+    var r = await fetch(url, opts);
+    if (!r.ok) throw new Error("BC " + r.status + ": " + (await r.text()).substring(0, 400));
+    var d = await r.json();
+    return { content: [{ type: "text", text: JSON.stringify(d.value !== undefined ? d.value : d, null, 2) }] };
+  });
+
   srv.tool("bc_inventory", "Items with inventory levels", Object.assign({}, C, {
     companyId: z.string(),
     top: z.number().optional().default(30),
