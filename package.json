@@ -1,15 +1,11 @@
 {
   "name": "bc-mcp-server",
-  "version": "2.0.0",
+  "version": "6.0.0",
   "type": "module",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.15.0",
+    "@modelcontextprotocol/sdk": "latest",
     "express": "^4.21.0",
     "zod": "^3.24.0"
   }
